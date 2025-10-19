@@ -10,7 +10,7 @@ import wweb from 'whatsapp-web.js'; // CommonJS -> default import
 const { Client, LocalAuth } = wweb || {};
 import { db, admin } from './firebaseAdmin.js';
 import { saveSession, clearSession } from './sessionStore.js';
-import { askLovableAI } from './lovableClient.js';
+import { processIncomingMessage } from './lovableClient.js';
 
 if (!Client || !LocalAuth) {
   throw new Error('[startup] whatsapp-web.js não exportou Client/LocalAuth. Cheque a versão instalada.');
@@ -141,6 +141,7 @@ async function ensureClient(tenantId) {
       clients.delete(tenantId);
     });
 
+    // ===== Handler de mensagens (delegado ao Lovable) =====
     client.on('message', async (msg) => {
       const msgId = msg?.id?._serialized || msg?.id?.id || null;
       const from = msg?.from || '';
@@ -148,10 +149,12 @@ async function ensureClient(tenantId) {
       try {
         if (!msgId || !from || !body) return;
 
+        // Idempotência (não reprocessa a mesma mensagem)
         const ref = db.collection('tenants').doc(tenantId).collection('messages').doc(msgId);
         const exists = await ref.get();
         if (exists.exists) return;
 
+        // Log IN
         await ref.set({
           direction: 'in',
           from,
@@ -165,35 +168,19 @@ async function ensureClient(tenantId) {
           createdAt: admin.firestore.FieldValue.serverTimestamp()
         }, { merge: true });
 
-        let reply = null;
-        try {
-          reply = await askLovableAI({
-            tenantId,
-            from,
-            text: body,
-            context: { via: 'whatsapp-web', tenantId }
-          });
-        } catch (e) {
-          log(tenantId, 'ERROR', 'IA erro:', e?.message || e);
-        }
-        if (!reply || !String(reply).trim()) reply = 'Olá! Já já te respondo. 😊';
-        reply = cap(reply, 4000);
-
+        // 👉 Delegamos o processamento/IA para o Lovable
+        //    A função deve enviar a resposta pelo próprio client e
+        //    retornar true/false (entregue).
         let delivered = false;
-        for (let attempt = 1; attempt <= 2; attempt++) {
-          try {
-            await client.sendMessage(from, reply);
-            delivered = true;
-            break;
-          } catch (e) {
-            log(tenantId, 'ERROR', `Falha sendMessage (tentativa ${attempt}):`, e?.message || e);
-            if (attempt === 1) await sleep(400);
-          }
+        try {
+          delivered = !!(await processIncomingMessage(entry.client, msg, tenantId));
+        } catch (e) {
+          log(tenantId, 'ERROR', 'Lovable processIncomingMessage erro:', e?.message || e);
         }
 
+        // Log OUT “técnico” (quem manda o texto é o Lovable)
         await ref.collection('parts').add({
           direction: 'out',
-          text: reply,
           delivered,
           createdAt: admin.firestore.FieldValue.serverTimestamp()
         });
