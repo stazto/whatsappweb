@@ -6,19 +6,14 @@ dotenv.config();
 
 import express from 'express';
 import QRCode from 'qrcode';
-import wweb from 'whatsapp-web.js'; // whatsapp-web.js é CommonJS -> import default
+import wweb from 'whatsapp-web.js'; // CommonJS -> default import
 const { Client, LocalAuth } = wweb || {};
 import { db, admin } from './firebaseAdmin.js';
 import { saveSession, clearSession } from './sessionStore.js';
 import { askLovableAI } from './lovableClient.js';
 
-// ===== Guard para versões inesperadas do whatsapp-web.js =====
 if (!Client || !LocalAuth) {
-  // Ajuda muito quando a lib muda ou instala versão diferente
-  throw new Error(
-    "[startup] whatsapp-web.js não exportou Client/LocalAuth. " +
-    "Verifique a versão instalada e mantenha 'import wweb from \"whatsapp-web.js\"; const { Client, LocalAuth } = wweb;'"
-  );
+  throw new Error('[startup] whatsapp-web.js não exportou Client/LocalAuth. Cheque a versão instalada.');
 }
 
 // ===== Config =====
@@ -27,15 +22,11 @@ const API_KEY = process.env.API_KEY || '';
 const SESSION_STORE = (process.env.SESSION_STORE || 'firestore').toLowerCase();
 const LOG_LEVEL = (process.env.LOG_LEVEL || 'info').toLowerCase();
 const CORS_ORIGINS = (process.env.CORS_ORIGINS || '')
-  .split(',')
-  .map(s => s.trim())
-  .filter(Boolean);
+  .split(',').map(s => s.trim()).filter(Boolean);
 
 // ===== App =====
 const app = express();
 app.use(express.json({ limit: '2mb' }));
-
-// CORS opcional (se o frontend chamar direto a VM)
 if (CORS_ORIGINS.length) {
   app.use((req, res, next) => {
     const origin = req.headers.origin || '';
@@ -50,7 +41,7 @@ if (CORS_ORIGINS.length) {
   });
 }
 
-// ===== Auth (Bearer) =====
+// ===== Auth =====
 function auth(req, res, next) {
   const hdr = req.headers['authorization'] || '';
   const token = hdr.startsWith('Bearer ') ? hdr.slice(7) : '';
@@ -60,7 +51,7 @@ function auth(req, res, next) {
 
 // ===== In-memory =====
 const clients = new Map();         // tenantId -> { client, status, qr, readyAt }
-const clientInitLocks = new Map(); // tenantId -> Promise (evita corrida de init)
+const clientInitLocks = new Map(); // tenantId -> Promise
 
 // ===== Helpers =====
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -80,15 +71,11 @@ function log(tenantId, level, ...args) {
 
 // ===== Core =====
 async function ensureClient(tenantId) {
-  if (!tenantId || typeof tenantId !== 'string') {
-    throw new Error('tenantId inválido');
-  }
+  if (!tenantId || typeof tenantId !== 'string') throw new Error('tenantId inválido');
 
-  // Já existe?
   const current = clients.get(tenantId);
   if (current?.client) return current;
 
-  // Lock de inicialização p/ evitar corrida
   if (clientInitLocks.has(tenantId)) {
     await clientInitLocks.get(tenantId);
     return clients.get(tenantId);
@@ -98,7 +85,6 @@ async function ensureClient(tenantId) {
     log(tenantId, 'INFO', 'Inicializando cliente...');
     const entry = { client: null, status: 'starting', qr: '', readyAt: null };
 
-    // LocalAuth separa diretório por clientId (persistente no disco da VM)
     const authStrategy = new LocalAuth({ clientId: `tenant_${tenantId}` });
 
     const client = new Client({
@@ -155,21 +141,17 @@ async function ensureClient(tenantId) {
       clients.delete(tenantId);
     });
 
-    // Mensagens recebidas
     client.on('message', async (msg) => {
       const msgId = msg?.id?._serialized || msg?.id?.id || null;
       const from = msg?.from || '';
       const body = cap(msg?.body?.trim?.(), 4000);
-
       try {
         if (!msgId || !from || !body) return;
 
-        // Idempotência: se já existe, encerra
         const ref = db.collection('tenants').doc(tenantId).collection('messages').doc(msgId);
         const exists = await ref.get();
         if (exists.exists) return;
 
-        // Log IN
         await ref.set({
           direction: 'in',
           from,
@@ -183,7 +165,6 @@ async function ensureClient(tenantId) {
           createdAt: admin.firestore.FieldValue.serverTimestamp()
         }, { merge: true });
 
-        // Chama IA (Lovable / Supabase Edge)
         let reply = null;
         try {
           reply = await askLovableAI({
@@ -195,12 +176,9 @@ async function ensureClient(tenantId) {
         } catch (e) {
           log(tenantId, 'ERROR', 'IA erro:', e?.message || e);
         }
-        if (!reply || !String(reply).trim()) {
-          reply = 'Olá! Já já te respondo. 😊';
-        }
+        if (!reply || !String(reply).trim()) reply = 'Olá! Já já te respondo. 😊';
         reply = cap(reply, 4000);
 
-        // Envia com 1 retry
         let delivered = false;
         for (let attempt = 1; attempt <= 2; attempt++) {
           try {
@@ -213,7 +191,6 @@ async function ensureClient(tenantId) {
           }
         }
 
-        // Log OUT
         await ref.collection('parts').add({
           direction: 'out',
           text: reply,
@@ -225,7 +202,6 @@ async function ensureClient(tenantId) {
       }
     });
 
-    // Inicializa
     try {
       await client.initialize();
     } catch (e) {
@@ -239,8 +215,7 @@ async function ensureClient(tenantId) {
 
   clientInitLocks.set(tenantId, initPromise);
   try {
-    const result = await initPromise;
-    return result;
+    return await initPromise;
   } finally {
     clientInitLocks.delete(tenantId);
   }
@@ -268,7 +243,7 @@ app.get('/sessions/:tenantId/qr', auth, async (req, res) => {
       res.setHeader('Content-Type', 'image/svg+xml');
       return res.send(svg);
     } catch (e) {
-      log(tenantId, 'ERROR', 'QR encode error:', e?.message || e);
+      log(tenantId, 'ERROR', 'qr encode error:', e?.message || e);
       return res.status(500).json({ error: 'qr_encode_failed' });
     }
   } catch (e) {
@@ -292,9 +267,7 @@ app.delete('/sessions/:tenantId', auth, async (req, res) => {
   const { tenantId } = req.params;
   try {
     const entry = clients.get(tenantId);
-    if (entry?.client) {
-      try { await entry.client.destroy(); } catch {}
-    }
+    if (entry?.client) { try { await entry.client.destroy(); } catch {} }
     clients.delete(tenantId);
     try { await clearSession(tenantId); } catch {}
     log(tenantId, 'INFO', 'Sessão encerrada e limpa');
@@ -345,23 +318,14 @@ app.post('/sessions/:tenantId/sendText', auth, async (req, res) => {
 app.get('/health', (_, res) => res.status(200).send('ok'));
 app.get('/ready',  (_, res) => res.status(200).send('ready'));
 
-// ===== Start & Shutdown =====
-const server = app.listen(PORT, () => {
+// Start & Shutdown
+const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`[${new Date().toISOString()}] WWeb multi-tenant up on :${PORT} (store=${SESSION_STORE})`);
 });
-
 process.on('SIGTERM', () => {
   console.log('SIGTERM recebido, encerrando servidor...');
-  server.close(() => {
-    console.log('Servidor fechado.');
-    process.exit(0);
-  });
+  server.close(() => { console.log('Servidor fechado.'); process.exit(0); });
   setTimeout(() => process.exit(0), 5000).unref();
 });
-
-process.on('uncaughtException', (err) => {
-  console.error('uncaughtException:', err?.stack || err?.message || err);
-});
-process.on('unhandledRejection', (reason) => {
-  console.error('unhandledRejection:', reason);
-});
+process.on('uncaughtException', (err) => console.error('uncaughtException:', err?.stack || err?.message || err));
+process.on('unhandledRejection', (reason) => console.error('unhandledRejection:', reason));
