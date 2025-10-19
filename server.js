@@ -6,17 +6,40 @@ dotenv.config();
 
 import express from 'express';
 import QRCode from 'qrcode';
-import { Client, LocalAuth } from 'whatsapp-web.js';
+import wweb from 'whatsapp-web.js';            // whatsapp-web.js é CommonJS -> import default
+const { Client, LocalAuth } = wweb;            // desestrutura a partir do default
 import { db, admin } from './firebaseAdmin.js';
 import { saveSession, clearSession } from './sessionStore.js';
 import { askLovableAI } from './lovableClient.js';
 
-const PORT = process.env.PORT || 8080;
+// ===== Config =====
+const PORT = Number(process.env.PORT || 8080);
 const API_KEY = process.env.API_KEY || '';
 const SESSION_STORE = (process.env.SESSION_STORE || 'firestore').toLowerCase();
+const LOG_LEVEL = (process.env.LOG_LEVEL || 'info').toLowerCase();
+const CORS_ORIGINS = (process.env.CORS_ORIGINS || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
 
+// ===== App =====
 const app = express();
 app.use(express.json({ limit: '2mb' }));
+
+// CORS opcional (útil se o frontend chamar direto a VM)
+if (CORS_ORIGINS.length) {
+  app.use((req, res, next) => {
+    const origin = req.headers.origin || '';
+    if (CORS_ORIGINS.includes(origin)) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+      res.setHeader('Vary', 'Origin');
+      res.setHeader('Access-Control-Allow-Methods', 'GET,POST,DELETE,OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    }
+    if (req.method === 'OPTIONS') return res.sendStatus(204);
+    next();
+  });
+}
 
 // ===== Auth (Bearer) =====
 function auth(req, res, next) {
@@ -27,24 +50,31 @@ function auth(req, res, next) {
 }
 
 // ===== In-memory =====
-const clients = new Map();              // tenantId -> { client, status, qr, readyAt }
-const clientInitLocks = new Map();      // tenantId -> Promise (evita corrida de init)
+const clients = new Map();         // tenantId -> { client, status, qr, readyAt }
+const clientInitLocks = new Map(); // tenantId -> Promise (evita corrida de init)
 
 // ===== Helpers =====
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const cap = (s, n) => (String(s || '').length > n ? String(s).slice(0, n) : String(s || ''));
 
+function shouldLog(level) {
+  const order = { error: 0, warn: 1, info: 2, debug: 3 };
+  return (order[level] ?? 2) <= (order[LOG_LEVEL] ?? 2);
+}
 function log(tenantId, level, ...args) {
-  const p = `[${new Date().toISOString()}][${tenantId}][${level}]`;
-  console.log(p, ...args);
+  if (!shouldLog(level.toLowerCase())) return;
+  const p = `[${new Date().toISOString()}][${tenantId || '-'}][${level}]`;
+  const fn = level === 'ERROR' || level === 'WARN' ? console.error : console.log;
+  fn(p, ...args);
 }
 
+// ===== Core =====
 async function ensureClient(tenantId) {
   if (!tenantId || typeof tenantId !== 'string') {
     throw new Error('tenantId inválido');
   }
 
-  // Se já existe, retorna
+  // Já existe?
   const current = clients.get(tenantId);
   if (current?.client) return current;
 
@@ -58,7 +88,7 @@ async function ensureClient(tenantId) {
     log(tenantId, 'INFO', 'Inicializando cliente...');
     const entry = { client: null, status: 'starting', qr: '', readyAt: null };
 
-    // LocalAuth faz separação por diretório de sessão (persistente no disco da VM)
+    // LocalAuth separa diretório por clientId (persistente no disco da VM)
     const authStrategy = new LocalAuth({ clientId: `tenant_${tenantId}` });
 
     const client = new Client({
@@ -85,32 +115,32 @@ async function ensureClient(tenantId) {
       entry.qr = qr;
       entry.status = 'qr';
       log(tenantId, 'INFO', 'QR gerado (aguardando scan)');
-      await saveSession(tenantId, { status: 'qr', ts: Date.now() }).catch(() => {});
+      try { await saveSession(tenantId, { status: 'qr', ts: Date.now() }); } catch {}
     });
 
     client.on('ready', async () => {
       entry.status = 'ready';
       entry.readyAt = new Date().toISOString();
       log(tenantId, 'INFO', 'Cliente pronto (ready)');
-      await saveSession(tenantId, { status: 'ready', ts: Date.now() }).catch(() => {});
+      try { await saveSession(tenantId, { status: 'ready', ts: Date.now() }); } catch {}
     });
 
     client.on('authenticated', async () => {
       entry.status = 'authenticated';
       log(tenantId, 'INFO', 'Autenticado');
-      await saveSession(tenantId, { status: 'authenticated', ts: Date.now() }).catch(() => {});
+      try { await saveSession(tenantId, { status: 'authenticated', ts: Date.now() }); } catch {}
     });
 
     client.on('auth_failure', async (msg) => {
       entry.status = 'auth_failure';
       log(tenantId, 'ERROR', 'Falha de autenticação:', msg);
-      await saveSession(tenantId, { status: 'auth_failure', msg, ts: Date.now() }).catch(() => {});
+      try { await saveSession(tenantId, { status: 'auth_failure', msg, ts: Date.now() }); } catch {}
     });
 
     client.on('disconnected', async (reason) => {
       entry.status = 'disconnected';
       log(tenantId, 'WARN', 'Desconectado:', reason);
-      await saveSession(tenantId, { status: 'disconnected', reason, ts: Date.now() }).catch(() => {});
+      try { await saveSession(tenantId, { status: 'disconnected', reason, ts: Date.now() }); } catch {}
       try { await client.destroy(); } catch {}
       clients.delete(tenantId);
     });
@@ -127,9 +157,7 @@ async function ensureClient(tenantId) {
         // Idempotência: se já existe, encerra
         const ref = db.collection('tenants').doc(tenantId).collection('messages').doc(msgId);
         const exists = await ref.get();
-        if (exists.exists) {
-          return; // já processado
-        }
+        if (exists.exists) return;
 
         // Log IN
         await ref.set({
@@ -145,7 +173,7 @@ async function ensureClient(tenantId) {
           createdAt: admin.firestore.FieldValue.serverTimestamp()
         }, { merge: true });
 
-        // Chama IA
+        // Chama IA (Lovable / Supabase Edge)
         let reply = null;
         try {
           reply = await askLovableAI({
@@ -258,7 +286,7 @@ app.delete('/sessions/:tenantId', auth, async (req, res) => {
       try { await entry.client.destroy(); } catch {}
     }
     clients.delete(tenantId);
-    await clearSession(tenantId).catch(() => {});
+    try { await clearSession(tenantId); } catch {}
     log(tenantId, 'INFO', 'Sessão encerrada e limpa');
     return res.json({ tenantId, deleted: true });
   } catch (e) {
@@ -307,10 +335,11 @@ app.post('/sessions/:tenantId/sendText', auth, async (req, res) => {
 app.get('/health', (_, res) => res.status(200).send('ok'));
 app.get('/ready',  (_, res) => res.status(200).send('ready'));
 
-// Graceful shutdown (útil em PM2/rollouts)
+// ===== Start & Shutdown =====
 const server = app.listen(PORT, () => {
   console.log(`[${new Date().toISOString()}] WWeb multi-tenant up on :${PORT} (store=${SESSION_STORE})`);
 });
+
 process.on('SIGTERM', () => {
   console.log('SIGTERM recebido, encerrando servidor...');
   server.close(() => {
@@ -318,4 +347,11 @@ process.on('SIGTERM', () => {
     process.exit(0);
   });
   setTimeout(() => process.exit(0), 5000).unref();
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('uncaughtException:', err?.stack || err?.message || err);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('unhandledRejection:', reason);
 });
