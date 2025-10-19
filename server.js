@@ -1,15 +1,18 @@
-import 'dotenv/config';  
-import express from 'express';
+// server.js — WhatsApp Web (não-oficial) multi-tenant, robusto e idempotente
+// AVISO: automação via WhatsApp Web viola os Termos do WhatsApp. Use por sua conta e risco.
 
+import 'dotenv/config';                  // carrega .env antes de tudo (ESM)
 
 import express from 'express';
 import QRCode from 'qrcode';
-import wweb from 'whatsapp-web.js'; // CommonJS -> default import
-const { Client, LocalAuth } = wweb || {};
+import wweb from 'whatsapp-web.js';      // CommonJS -> default import
+const { Client, LocalAuth } = wweb;      // destrutura do default CJS
+
 import { db, admin } from './firebaseAdmin.js';
 import { saveSession, clearSession } from './sessionStore.js';
 import { processIncomingMessage } from './lovableClient.js';
 
+// Validação de exports do whatsapp-web.js
 if (!Client || !LocalAuth) {
   throw new Error('[startup] whatsapp-web.js não exportou Client/LocalAuth. Cheque a versão instalada.');
 }
@@ -27,6 +30,8 @@ const CORS_ORIGINS = (process.env.CORS_ORIGINS || '')
 // ===== App =====
 const app = express();
 app.use(express.json({ limit: '2mb' }));
+
+// CORS opcional
 if (CORS_ORIGINS.length) {
   app.use((req, res, next) => {
     const origin = req.headers.origin || '';
@@ -41,7 +46,7 @@ if (CORS_ORIGINS.length) {
   });
 }
 
-// ===== Auth =====
+// ===== Auth (Bearer) =====
 function auth(req, res, next) {
   const hdr = req.headers['authorization'] || '';
   const token = hdr.startsWith('Bearer ') ? hdr.slice(7) : '';
@@ -51,7 +56,7 @@ function auth(req, res, next) {
 
 // ===== In-memory =====
 const clients = new Map();         // tenantId -> { client, status, qr, readyAt }
-const clientInitLocks = new Map(); // tenantId -> Promise
+const clientInitLocks = new Map(); // tenantId -> Promise (evita corrida)
 
 // ===== Helpers =====
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -59,23 +64,29 @@ const cap = (s, n) => (String(s || '').length > n ? String(s).slice(0, n) : Stri
 
 function shouldLog(level) {
   const order = { error: 0, warn: 1, info: 2, debug: 3 };
-  return (order[level] ?? 2) <= (order[LOG_LEVEL] ?? 2);
+  const want = (order[level] ?? 2);
+  const cur = (order[LOG_LEVEL] ?? 2);
+  return want <= cur;
 }
 function log(tenantId, level, ...args) {
   const lvl = String(level).toLowerCase();
   if (!shouldLog(lvl)) return;
-  const p = `[${new Date().toISOString()}][${tenantId || '-'}][${level}]`;
+  const prefix = `[${new Date().toISOString()}][${tenantId || '-'}][${level}]`;
   const fn = lvl === 'error' || lvl === 'warn' ? console.error : console.log;
-  fn(p, ...args);
+  fn(prefix, ...args);
 }
 
 // ===== Core =====
 async function ensureClient(tenantId) {
-  if (!tenantId || typeof tenantId !== 'string') throw new Error('tenantId inválido');
+  if (!tenantId || typeof tenantId !== 'string') {
+    throw new Error('tenantId inválido');
+  }
 
+  // Já existe?
   const current = clients.get(tenantId);
   if (current?.client) return current;
 
+  // Lock de inicialização p/ evitar corrida
   if (clientInitLocks.has(tenantId)) {
     await clientInitLocks.get(tenantId);
     return clients.get(tenantId);
@@ -85,6 +96,7 @@ async function ensureClient(tenantId) {
     log(tenantId, 'INFO', 'Inicializando cliente...');
     const entry = { client: null, status: 'starting', qr: '', readyAt: null };
 
+    // LocalAuth separa diretório por clientId (persistente no disco da VM)
     const authStrategy = new LocalAuth({ clientId: `tenant_${tenantId}` });
 
     const client = new Client({
@@ -99,9 +111,9 @@ async function ensureClient(tenantId) {
           '--no-first-run',
           '--no-zygote',
           '--single-process',
-          '--disable-gpu'
-        ]
-      }
+          '--disable-gpu',
+        ],
+      },
     });
 
     entry.client = client;
@@ -150,11 +162,11 @@ async function ensureClient(tenantId) {
         const isGroup = from.endsWith('@g.us');
         const isChat = (msg?.type || 'chat') === 'chat';
 
-        // Ignora msgs próprias, de grupo e que não sejam "chat" ANTES de logar no Firestore
+        // Ignora msgs próprias, de grupo e não-chat ANTES de logar no Firestore
         if (msg?.fromMe || isGroup || !isChat) return;
         if (!msgId || !from || !body) return;
 
-        // Idempotência (não reprocessa a mesma mensagem)
+        // Idempotência
         const ref = db.collection('tenants').doc(tenantId).collection('messages').doc(msgId);
         const exists = await ref.get();
         if (exists.exists) return;
@@ -168,12 +180,12 @@ async function ensureClient(tenantId) {
             id: msg?.id || null,
             to: msg?.to || null,
             timestamp: msg?.timestamp || null,
-            type: msg?.type || null
+            type: msg?.type || null,
           },
-          createdAt: admin.firestore.FieldValue.serverTimestamp()
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
         }, { merge: true });
 
-        // 👉 Delegamos o processamento/IA para o Lovable (ele também envia a resposta)
+        // IA (Lovable) – a função também envia a resposta via client
         let delivered = false;
         try {
           delivered = !!(await processIncomingMessage(entry.client, msg, tenantId));
@@ -185,13 +197,14 @@ async function ensureClient(tenantId) {
         await ref.collection('parts').add({
           direction: 'out',
           delivered,
-          createdAt: admin.firestore.FieldValue.serverTimestamp()
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
         });
       } catch (e) {
         log(tenantId, 'ERROR', 'Erro no handler de mensagem:', e?.message || e);
       }
     });
 
+    // Inicializa
     try {
       await client.initialize();
     } catch (e) {
@@ -294,7 +307,7 @@ app.post('/sessions/:tenantId/sendText', auth, async (req, res) => {
       to: String(to),
       text: payload,
       delivered,
-      createdAt: admin.firestore.FieldValue.serverTimestamp()
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
     });
 
     return res.json({ ok: true, delivered });
@@ -308,14 +321,23 @@ app.post('/sessions/:tenantId/sendText', auth, async (req, res) => {
 app.get('/health', (_, res) => res.status(200).send('ok'));
 app.get('/ready',  (_, res) => res.status(200).send('ready'));
 
-// Start & Shutdown
+// ===== Start & Shutdown =====
 const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`[${new Date().toISOString()}] WWeb multi-tenant up on :${PORT} (store=${SESSION_STORE})`);
 });
+
 process.on('SIGTERM', () => {
   console.log('SIGTERM recebido, encerrando servidor...');
-  server.close(() => { console.log('Servidor fechado.'); process.exit(0); });
+  server.close(() => {
+    console.log('Servidor fechado.');
+    process.exit(0);
+  });
   setTimeout(() => process.exit(0), 5000).unref();
 });
-process.on('uncaughtException', (err) => console.error('uncaughtException:', err?.stack || err?.message || err));
-process.on('unhandledRejection', (reason) => console.error('unhandledRejection:', reason));
+
+process.on('uncaughtException', (err) => {
+  console.error('uncaughtException:', err?.stack || err?.message || err);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('unhandledRejection:', reason);
+});
