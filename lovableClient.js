@@ -6,8 +6,13 @@
 
 import fetch from 'cross-fetch';
 
-const SUPABASE_URL = process.env.SUPABASE_URL || '';
-const SUPABASE_KEY = process.env.SUPABASE_KEY || '';
+/** ─────────── Ler variáveis de ambiente SOMENTE no uso ─────────── **/
+function getSupabaseEnv() {
+  return {
+    SUPABASE_URL: process.env.SUPABASE_URL || '',
+    SUPABASE_KEY: process.env.SUPABASE_KEY || '',
+  };
+}
 
 /** ───────────────────────── Helpers ───────────────────────── **/
 function normPhoneToBR55(raw) {
@@ -22,6 +27,7 @@ function normPhoneToBR55(raw) {
 }
 
 async function sb(path, { method = 'GET', headers = {}, body } = {}) {
+  const { SUPABASE_URL, SUPABASE_KEY } = getSupabaseEnv();
   if (!SUPABASE_URL || !SUPABASE_KEY) {
     throw new Error('SUPABASE_URL/SUPABASE_KEY não configurados');
   }
@@ -38,11 +44,9 @@ async function sb(path, { method = 'GET', headers = {}, body } = {}) {
     body: body ? JSON.stringify(body) : undefined,
   });
 
-  // 204/201 podem vir sem body
-  const isJson =
-    (res.headers.get('content-type') || '').includes('application/json');
-
+  const isJson = (res.headers.get('content-type') || '').includes('application/json');
   const data = isJson ? await res.json().catch(() => null) : null;
+
   if (!res.ok) {
     const text = !isJson ? await res.text().catch(() => '') : JSON.stringify(data);
     throw new Error(`Supabase error ${res.status}: ${text}`);
@@ -118,15 +122,15 @@ async function saveMessage(clinicId, phoneRaw, content, messageType, whatsappMes
 /** ─────────────────────── IA (Edge Function) ─────────────────────── **/
 async function getAIResponse(clinicId, patientPhoneRaw, message) {
   try {
+    const { SUPABASE_URL, SUPABASE_KEY } = getSupabaseEnv();
     if (!SUPABASE_URL || !SUPABASE_KEY) {
       console.error('❌ SUPABASE_URL ou SUPABASE_KEY não configurados');
       return 'Desculpe, configuração incorreta. Entre em contato com o suporte.';
     }
 
-    // use o phone normalizado para a IA também
     const patient_phone = normPhoneToBR55(patientPhoneRaw);
-
     const endpoint = `${SUPABASE_URL.replace(/\/+$/, '')}/functions/v1/chat-assistant-whatsapp`;
+
     console.log(`🤖 Chamando IA: ${endpoint}`);
 
     const response = await fetch(endpoint, {
