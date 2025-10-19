@@ -1,6 +1,3 @@
-// server.js — WhatsApp Web (não-oficial) multi-tenant, robusto e idempotente
-// AVISO: automação via WhatsApp Web viola os Termos do WhatsApp. Use por sua conta e risco.
-
 import dotenv from 'dotenv';
 dotenv.config();
 
@@ -22,7 +19,9 @@ const API_KEY = process.env.API_KEY || '';
 const SESSION_STORE = (process.env.SESSION_STORE || 'firestore').toLowerCase();
 const LOG_LEVEL = (process.env.LOG_LEVEL || 'info').toLowerCase();
 const CORS_ORIGINS = (process.env.CORS_ORIGINS || '')
-  .split(',').map(s => s.trim()).filter(Boolean);
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
 
 // ===== App =====
 const app = express();
@@ -143,10 +142,15 @@ async function ensureClient(tenantId) {
 
     // ===== Handler de mensagens (delegado ao Lovable) =====
     client.on('message', async (msg) => {
-      const msgId = msg?.id?._serialized || msg?.id?.id || null;
-      const from = msg?.from || '';
-      const body = cap(msg?.body?.trim?.(), 4000);
       try {
+        const msgId = msg?.id?._serialized || msg?.id?.id || null;
+        const from = msg?.from || '';
+        const body = cap(msg?.body?.trim?.(), 4000);
+        const isGroup = from.endsWith('@g.us');
+        const isChat = (msg?.type || 'chat') === 'chat';
+
+        // Ignora msgs próprias, de grupo e que não sejam "chat" ANTES de logar no Firestore
+        if (msg?.fromMe || isGroup || !isChat) return;
         if (!msgId || !from || !body) return;
 
         // Idempotência (não reprocessa a mesma mensagem)
@@ -168,9 +172,7 @@ async function ensureClient(tenantId) {
           createdAt: admin.firestore.FieldValue.serverTimestamp()
         }, { merge: true });
 
-        // 👉 Delegamos o processamento/IA para o Lovable
-        //    A função deve enviar a resposta pelo próprio client e
-        //    retornar true/false (entregue).
+        // 👉 Delegamos o processamento/IA para o Lovable (ele também envia a resposta)
         let delivered = false;
         try {
           delivered = !!(await processIncomingMessage(entry.client, msg, tenantId));
@@ -178,7 +180,7 @@ async function ensureClient(tenantId) {
           log(tenantId, 'ERROR', 'Lovable processIncomingMessage erro:', e?.message || e);
         }
 
-        // Log OUT “técnico” (quem manda o texto é o Lovable)
+        // Log OUT “técnico” (quem envia o texto é o próprio handler do Lovable)
         await ref.collection('parts').add({
           direction: 'out',
           delivered,
