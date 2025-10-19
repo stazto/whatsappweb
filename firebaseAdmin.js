@@ -1,34 +1,40 @@
-// firebaseAdmin.js
-// Inicializa o Admin SDK usando ADC da VM (Service Account) e mantém API compatível com seu server.
-// Robusto contra diferenças entre versões do firebase-admin (apps pode não existir).
+// firebaseAdmin.js — inicialização do Admin SDK (ESM + v12) para GCE/VM
+import { initializeApp, getApps, applicationDefault } from 'firebase-admin/app';
+import { getFirestore, FieldValue, Timestamp } from 'firebase-admin/firestore';
 
-import * as admin from 'firebase-admin';
-
+// PROJECT_ID vem do .env ou das variáveis padrão do GCP
 const PROJECT_ID =
   process.env.PROJECT_ID ||
   process.env.GCLOUD_PROJECT ||
-  process.env.GOOGLE_CLOUD_PROJECT || undefined;
+  process.env.GOOGLE_CLOUD_PROJECT ||
+  undefined;
 
-// Nem todas as versões expõem `admin.apps`. Protege contra undefined.
-const hasAppsArray = !!(admin && admin.apps && Array.isArray(admin.apps));
-
-try {
-  if (!hasAppsArray || admin.apps.length === 0) {
-    // initializeApp disponível em todas as versões estáveis
-    admin.initializeApp({
-      credential: admin.credential.applicationDefault(),
-      // projectId opcional, mas ajuda em ambientes sem metadata server
-      ...(PROJECT_ID ? { projectId: PROJECT_ID } : {}),
+// Inicializa só uma vez (idempotente)
+if (getApps().length === 0) {
+  try {
+    initializeApp({
+      credential: applicationDefault(), // usa a service account da VM (ADC)
+      projectId: PROJECT_ID,
     });
+    // eslint-disable-next-line no-console
+    console.log(`[firebaseAdmin] inicializado (projectId=${PROJECT_ID || 'auto'})`);
+  } catch (e) {
+    // eslint-disable-next-line no-console
+    console.error('[firebaseAdmin] Falha ao inicializar:', e?.message || e);
+    throw e;
   }
-} catch (e) {
-  // Loga e repropaga para falhar cedo com mensagem clara
-  console.error('[firebaseAdmin] Falha ao inicializar firebase-admin:', e?.message || e);
-  throw e;
 }
 
-// Garante Firestore; em versões novas é admin.firestore(), mantendo compat com seu server.js
-export const db = admin.firestore();
+// Firestore pronto
+const db = getFirestore();
 
-// Exporta `admin` para você continuar usando `admin.firestore.FieldValue.serverTimestamp()`
-export { admin };
+// Compat: exporta 'admin.firestore.FieldValue' para o server.js atual
+// (no v12 modular não existe 'admin' default; criamos um "adapter" mínimo)
+const admin = {
+  firestore: {
+    FieldValue,
+    Timestamp,
+  },
+};
+
+export { db, admin };

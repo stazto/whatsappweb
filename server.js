@@ -6,11 +6,20 @@ dotenv.config();
 
 import express from 'express';
 import QRCode from 'qrcode';
-import wweb from 'whatsapp-web.js';            // whatsapp-web.js é CommonJS -> import default
-const { Client, LocalAuth } = wweb;            // desestrutura a partir do default
+import wweb from 'whatsapp-web.js'; // whatsapp-web.js é CommonJS -> import default
+const { Client, LocalAuth } = wweb || {};
 import { db, admin } from './firebaseAdmin.js';
 import { saveSession, clearSession } from './sessionStore.js';
 import { askLovableAI } from './lovableClient.js';
+
+// ===== Guard para versões inesperadas do whatsapp-web.js =====
+if (!Client || !LocalAuth) {
+  // Ajuda muito quando a lib muda ou instala versão diferente
+  throw new Error(
+    "[startup] whatsapp-web.js não exportou Client/LocalAuth. " +
+    "Verifique a versão instalada e mantenha 'import wweb from \"whatsapp-web.js\"; const { Client, LocalAuth } = wweb;'"
+  );
+}
 
 // ===== Config =====
 const PORT = Number(process.env.PORT || 8080);
@@ -26,7 +35,7 @@ const CORS_ORIGINS = (process.env.CORS_ORIGINS || '')
 const app = express();
 app.use(express.json({ limit: '2mb' }));
 
-// CORS opcional (útil se o frontend chamar direto a VM)
+// CORS opcional (se o frontend chamar direto a VM)
 if (CORS_ORIGINS.length) {
   app.use((req, res, next) => {
     const origin = req.headers.origin || '';
@@ -62,9 +71,10 @@ function shouldLog(level) {
   return (order[level] ?? 2) <= (order[LOG_LEVEL] ?? 2);
 }
 function log(tenantId, level, ...args) {
-  if (!shouldLog(level.toLowerCase())) return;
+  const lvl = String(level).toLowerCase();
+  if (!shouldLog(lvl)) return;
   const p = `[${new Date().toISOString()}][${tenantId || '-'}][${level}]`;
-  const fn = level === 'ERROR' || level === 'WARN' ? console.error : console.log;
+  const fn = lvl === 'error' || lvl === 'warn' ? console.error : console.log;
   fn(p, ...args);
 }
 
