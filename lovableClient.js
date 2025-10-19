@@ -18,14 +18,17 @@ const SUPABASE_KEY = process.env.SUPABASE_KEY;
  */
 export async function processIncomingMessage(client, message, clinicId) {
   try {
-    // Ignorar mensagens próprias, de grupo, etc
-    if (message.fromMe || message.isGroupMsg || message.type !== 'chat') {
+    // Ignorar mensagens próprias e de grupos
+    // (em whatsapp-web.js, grupos terminam com @g.us)
+    if (message.fromMe || String(message.from || '').endsWith('@g.us')) {
       return;
     }
 
-    const from = message.from.replace('@c.us', '');
+    const from = String(message.from || '').replace('@c.us', '');
     const text = message.body;
-    const messageId = message.id.id;
+    const messageId = message?.id?.id;
+
+    if (!from || !text) return;
 
     console.log(`📩 Nova mensagem de ${from}: ${text}`);
 
@@ -42,8 +45,8 @@ export async function processIncomingMessage(client, message, clinicId) {
 
     console.log(`🤖 IA respondeu: ${aiReply}`);
 
-    // 3. Enviar resposta pelo WhatsApp
-    await client.sendText(message.from, aiReply);
+    // 3. Enviar resposta pelo WhatsApp (API correta do whatsapp-web.js)
+    await client.sendMessage(message.from, aiReply);
 
     // 4. Salvar resposta da IA no Supabase
     await saveMessage(clinicId, from, aiReply, 'sent', null);
@@ -68,8 +71,8 @@ async function saveMessage(clinicId, phone, content, messageType, whatsappMessag
       `https://lqouhkwszyseethnhvoo.supabase.co/rest/v1/whatsapp_conversations?clinic_id=eq.${clinicId}&patient_phone=eq.${formattedPhone}&select=id`,
       {
         headers: {
-      'apikey': SUPABASE_KEY,
-      'Authorization': `Bearer ${SUPABASE_KEY}`,
+          'apikey': SUPABASE_KEY,
+          'Authorization': `Bearer ${SUPABASE_KEY}`,
           'Content-Type': 'application/json'
         }
       }
