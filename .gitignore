@@ -1,0 +1,8 @@
+cat > .gitignore <<'EOF'
+node_modules/
+.env
+sessions/
+.wwebjs_auth/
+npm-debug.log*
+.DS_Store
+EOF
